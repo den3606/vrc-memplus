@@ -2,6 +2,8 @@
 
 写真をドロップするだけで VRChat Print に変換・アップロードできる Windows 向けデスクトップアプリです。
 
+![VRCPrint Desktop のスクリーンショット](./assets/image.png)
+
 ## 機能
 
 - **ドラッグ＆ドロップ** — 管理画面に写真をドロップすると自動で VRCPrint 変換 → アップロード

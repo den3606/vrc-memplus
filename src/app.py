@@ -21,7 +21,7 @@ from .paths import app_icon_path
 from .gallery_prepare import prepare_gallery_image
 from .icon_prepare import prepare_icon_image
 from .vrchat_client import GalleryInfo, IconInfo, PrintInfo, TwoFactorRequired, VRChatClient
-from .vrcprint_converter import (
+from .print_converter import (
     ORIG_H,
     ORIG_W,
     PORT_H,
@@ -84,7 +84,7 @@ except ImportError:
     DND_AVAILABLE = False
 
 
-class VRCPrintApp(ctk.CTk):
+class VRCMemApp(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
         if DND_AVAILABLE:
@@ -1852,7 +1852,7 @@ class VRCPrintApp(ctk.CTk):
 
 
 def main() -> None:
-    app = VRCPrintApp()
+    app = VRCMemApp()
     app.mainloop()
 
 

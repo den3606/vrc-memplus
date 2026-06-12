@@ -361,6 +361,6 @@ def batch_convert(
     outputs: list[Path] = []
     for input_path in input_paths:
         src = Path(input_path)
-        out = output_dir / f"{src.stem}_vrcprint.png"
+        out = output_dir / f"{src.stem}_print.png"
         outputs.append(convert_file(src, out, options))
     return outputs

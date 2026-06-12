@@ -8,7 +8,7 @@ from pathlib import Path
 from PIL import Image
 
 from src.gallery_prepare import prepare_gallery_image, validate_gallery_dimensions
-from src.vrcprint_converter import (
+from src.print_converter import (
     LANDSCAPE_UPLOAD_SIZE,
     ORIG_H,
     ORIG_W,

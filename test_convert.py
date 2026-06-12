@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from src.vrcprint_converter import PrintOptions, convert_file
+from src.print_converter import PrintOptions, convert_file
 
 
 def main() -> None:
@@ -18,7 +18,7 @@ def main() -> None:
         print(f"File not found: {src}")
         sys.exit(1)
 
-    out = src.with_name(f"{src.stem}_vrcprint.png")
+    out = src.with_name(f"{src.stem}_print.png")
     options = PrintOptions(note="test", author_name="TestUser", world_name="TestWorld")
     result = convert_file(src, out, options)
     print(f"OK: {result} ({result.stat().st_size} bytes)")

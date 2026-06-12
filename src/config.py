@@ -33,6 +33,7 @@ class AppSettings:
     default_set_icon_on_upload: bool = True
     output_dir: str = ""
     auth_cookie: str = ""
+    two_factor_auth_cookie: str = ""
     user_id: str = ""
     display_name: str = ""
 

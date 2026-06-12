@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from http.cookiejar import Cookie
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import requests
 import vrchatapi
 from vrchatapi.api import authentication_api, prints_api
-from vrchatapi.exceptions import UnauthorizedException
+from vrchatapi.exceptions import ApiException, UnauthorizedException
 from vrchatapi.models.two_factor_auth_code import TwoFactorAuthCode
 from vrchatapi.models.two_factor_email_code import TwoFactorEmailCode
 
@@ -68,13 +69,18 @@ class VRChatClient:
         return bool(self.settings.auth_cookie or self._get_auth_from_jar())
 
     def _get_auth_from_jar(self) -> str:
+        return self._get_cookie_from_jar("auth")
+
+    def _get_cookie_from_jar(self, name: str) -> str:
         if not self._api_client:
             return ""
-        jar = self._api_client.rest_client.cookie_jar
-        for cookie in jar:
-            if cookie.name == "auth" and cookie.value:
+        for cookie in self._api_client.rest_client.cookie_jar:
+            if cookie.name == name and cookie.value:
                 return cookie.value
         return ""
+
+    def _has_pending_login_session(self) -> bool:
+        return bool(self._api_client and self._get_cookie_from_jar("auth"))
 
     def _user_agent(self) -> str:
         email = self.settings.contact_email.strip()
@@ -103,21 +109,126 @@ class VRChatClient:
             return cookie_header.split("=", 1)[1].split(";", 1)[0].strip()
         return cookie_header
 
-    def _save_cookie(self) -> None:
+    def _make_vrchat_cookie(self, name: str, value: str) -> Cookie:
+        return Cookie(
+            version=0,
+            name=name,
+            value=value,
+            port=None,
+            port_specified=False,
+            domain="api.vrchat.cloud",
+            domain_specified=True,
+            domain_initial_dot=False,
+            path="/",
+            path_specified=True,
+            secure=True,
+            expires=None,
+            discard=True,
+            comment=None,
+            comment_url=None,
+            rest={"HttpOnly": None},
+            rfc2109=False,
+        )
+
+    def _save_cookies_from_jar(self) -> None:
         if not self._api_client:
             return
-        auth_value = self._get_auth_from_jar()
+        auth_value = self._get_cookie_from_jar("auth")
         if not auth_value:
             cookie_header = self._api_client.cookie or ""
             auth_value = self._extract_auth_value(cookie_header)
+        two_factor_value = self._get_cookie_from_jar("twoFactorAuth")
         if auth_value:
             self.settings.auth_cookie = auth_value
-            self.settings.save()
+        if two_factor_value:
+            self.settings.two_factor_auth_cookie = two_factor_value
 
-    def _apply_saved_cookie(self, configuration: vrchatapi.Configuration) -> None:
-        token = self._extract_auth_value(self.settings.auth_cookie)
-        if token:
-            configuration.api_key["authCookie"] = f"auth={token}"
+    def _apply_saved_cookies(self, configuration: vrchatapi.Configuration) -> None:
+        auth_token = self._extract_auth_value(self.settings.auth_cookie)
+        if auth_token:
+            configuration.api_key["authCookie"] = f"auth={auth_token}"
+        two_factor_token = self._extract_auth_value(self.settings.two_factor_auth_cookie)
+        if two_factor_token:
+            configuration.api_key["twoFactorAuthCookie"] = f"twoFactorAuth={two_factor_token}"
+
+    def _inject_saved_cookies_into_jar(self) -> None:
+        if not self._api_client:
+            return
+        jar = self._api_client.rest_client.cookie_jar
+        for name, setting_attr in (
+            ("auth", "auth_cookie"),
+            ("twoFactorAuth", "two_factor_auth_cookie"),
+        ):
+            value = self._extract_auth_value(getattr(self.settings, setting_attr, ""))
+            if value:
+                jar.set_cookie(self._make_vrchat_cookie(name, value))
+
+    def _apply_cookies_to_configuration(self) -> None:
+        if not self._api_client:
+            return
+        config = self._api_client.configuration
+        auth_token = self._extract_auth_value(self.settings.auth_cookie)
+        if auth_token:
+            config.api_key["authCookie"] = f"auth={auth_token}"
+        else:
+            config.api_key.pop("authCookie", None)
+        two_factor_token = self._extract_auth_value(self.settings.two_factor_auth_cookie)
+        if two_factor_token:
+            config.api_key["twoFactorAuthCookie"] = f"twoFactorAuth={two_factor_token}"
+        else:
+            config.api_key.pop("twoFactorAuthCookie", None)
+
+    def _close_client(self) -> None:
+        if self._api_client is not None:
+            self._api_client.close()
+        self._api_client = None
+        self._auth_api = None
+        self._prints_api = None
+
+    def _sync_session_auth(self) -> None:
+        self._session.cookies.clear()
+        for name, value in self._auth_cookies().items():
+            self._session.cookies.set(
+                name,
+                value,
+                domain="api.vrchat.cloud",
+                path="/",
+            )
+
+    def clear_local_session(self) -> None:
+        self._close_client()
+        self._session.cookies.clear()
+        self.settings.auth_cookie = ""
+        self.settings.two_factor_auth_cookie = ""
+        self.settings.user_id = ""
+        self.settings.display_name = ""
+        self.settings.save()
+
+    def _handle_unauthorized(self, exc: ApiException) -> None:
+        if getattr(exc, "status", None) == 401:
+            self.clear_local_session()
+            raise SessionExpiredError("ログインの有効期限が切れました。再ログインしてください。") from exc
+        raise exc
+
+    def _call_authenticated_api(self, action: Callable[[], Any]) -> Any:
+        try:
+            return action()
+        except UnauthorizedException as exc:
+            self._handle_unauthorized(exc)
+        except ApiException as exc:
+            self._handle_unauthorized(exc)
+        raise RuntimeError("unreachable")
+
+    def _raise_for_http_response(self, response: requests.Response, label: str) -> None:
+        if response.status_code == 401:
+            self.clear_local_session()
+            raise SessionExpiredError("ログインの有効期限が切れました。再ログインしてください。")
+        if response.status_code >= 400:
+            try:
+                detail = response.json().get("error", {}).get("message", response.text)
+            except Exception:
+                detail = response.text
+            raise RuntimeError(f"{label} ({response.status_code}): {detail}")
 
     def _ensure_client(self) -> None:
         if self._api_client is not None:
@@ -127,9 +238,47 @@ class VRChatClient:
             username=self.settings.username or None,
             password=None,
         )
-        self._apply_saved_cookie(configuration)
+        self._apply_saved_cookies(configuration)
 
         self._configure_api_client(configuration)
+        self._inject_saved_cookies_into_jar()
+        self._apply_cookies_to_configuration()
+        self._sync_session_auth()
+
+    def _begin_login_session(self, username: str, password: str) -> None:
+        configuration = vrchatapi.Configuration(username=username, password=password)
+        self._close_client()
+        self._configure_api_client(configuration)
+
+    def _verify_two_factor(
+        self,
+        *,
+        two_factor_code: str | None,
+        email_two_factor_code: str | None,
+        reason: str,
+    ) -> None:
+        if "Email 2 Factor Authentication" in reason:
+            if not email_two_factor_code:
+                raise TwoFactorRequired("email")
+            self._auth_api.verify2_fa_email_code(
+                two_factor_email_code=TwoFactorEmailCode(email_two_factor_code)
+            )
+            return
+        if "2 Factor Authentication" in reason:
+            if not two_factor_code:
+                raise TwoFactorRequired("totp")
+            self._auth_api.verify2_fa(two_factor_auth_code=TwoFactorAuthCode(two_factor_code))
+            return
+        raise RuntimeError(f"ログインに失敗しました: {reason}")
+
+    def _finalize_login(self, user: Any, username: str) -> str:
+        self.settings.user_id = user.id
+        self.settings.display_name = user.display_name or username
+        self._save_cookies_from_jar()
+        self._apply_cookies_to_configuration()
+        self._sync_session_auth()
+        self.settings.save()
+        return self.settings.display_name
 
     def login(
         self,
@@ -139,50 +288,67 @@ class VRChatClient:
         email_two_factor_code: str | None = None,
     ) -> str:
         self.settings.username = username
-        configuration = vrchatapi.Configuration(username=username, password=password)
-        self._apply_saved_cookie(configuration)
+        verifying_2fa = bool(two_factor_code or email_two_factor_code)
 
-        if self._api_client is not None:
-            self._api_client.close()
-        self._configure_api_client(configuration)
+        if verifying_2fa and self._has_pending_login_session():
+            configuration = self._api_client.configuration
+            configuration.username = username
+            configuration.password = password
+        else:
+            self._begin_login_session(username, password)
+            try:
+                user = self._auth_api.get_current_user()
+            except UnauthorizedException as exc:
+                if exc.status != 200:
+                    raise RuntimeError(f"ログインに失敗しました: {exc.reason}") from exc
+                try:
+                    self._verify_two_factor(
+                        two_factor_code=two_factor_code,
+                        email_two_factor_code=email_two_factor_code,
+                        reason=exc.reason or "",
+                    )
+                    user = self._auth_api.get_current_user()
+                except ApiException as api_exc:
+                    if getattr(api_exc, "status", None) == 401:
+                        raise RuntimeError(
+                            "2FA 認証に失敗しました。コードが正しいか確認して再度お試しください。"
+                        ) from api_exc
+                    raise
+            return self._finalize_login(user, username)
 
+        reason = (
+            "Email 2 Factor Authentication"
+            if email_two_factor_code and not two_factor_code
+            else "2 Factor Authentication"
+        )
         try:
+            self._verify_two_factor(
+                two_factor_code=two_factor_code,
+                email_two_factor_code=email_two_factor_code,
+                reason=reason,
+            )
             user = self._auth_api.get_current_user()
-        except UnauthorizedException as exc:
-            if exc.status != 200:
-                raise RuntimeError(f"ログインに失敗しました: {exc.reason}") from exc
-
-            reason = exc.reason or ""
-            if "Email 2 Factor Authentication" in reason:
-                if not email_two_factor_code:
-                    raise TwoFactorRequired("email")
-                self._auth_api.verify2_fa_email_code(
-                    two_factor_email_code=TwoFactorEmailCode(email_two_factor_code)
-                )
-            elif "2 Factor Authentication" in reason:
-                if not two_factor_code:
-                    raise TwoFactorRequired("totp")
-                self._auth_api.verify2_fa(two_factor_auth_code=TwoFactorAuthCode(two_factor_code))
-            else:
-                raise RuntimeError(f"ログインに失敗しました: {reason}") from exc
-            user = self._auth_api.get_current_user()
-
-        self.settings.user_id = user.id
-        self.settings.display_name = user.display_name or username
-        self._save_cookie()
-        self.settings.save()
-        return self.settings.display_name
+        except ApiException as exc:
+            if getattr(exc, "status", None) == 401:
+                raise RuntimeError(
+                    "2FA 認証に失敗しました。コードが正しいか確認し、"
+                    "一度ログインしてからもう一度お試しください。"
+                ) from exc
+            raise
+        return self._finalize_login(user, username)
 
     def restore_session(self) -> str:
         if not self.settings.auth_cookie:
             raise RuntimeError("保存されたセッションがありません")
+        self._close_client()
         self._ensure_client()
-        user = self._auth_api.get_current_user()
-        self.settings.user_id = user.id
-        self.settings.display_name = user.display_name or self.settings.username
-        self._save_cookie()
-        self.settings.save()
-        return self.settings.display_name
+        try:
+            user = self._auth_api.get_current_user()
+        except UnauthorizedException as exc:
+            self._handle_unauthorized(exc)
+        except ApiException as exc:
+            self._handle_unauthorized(exc)
+        return self._finalize_login(user, self.settings.username)
 
     def logout(self) -> None:
         if self._api_client is not None:
@@ -191,14 +357,7 @@ class VRChatClient:
                     self._auth_api.logout()
             except Exception:
                 pass
-            self._api_client.close()
-        self._api_client = None
-        self._auth_api = None
-        self._prints_api = None
-        self.settings.auth_cookie = ""
-        self.settings.user_id = ""
-        self.settings.display_name = ""
-        self.settings.save()
+        self.clear_local_session()
 
     def _to_print_info(self, data: dict[str, Any]) -> PrintInfo:
         files = data.get("files") or {}
@@ -216,7 +375,9 @@ class VRChatClient:
         self._ensure_client()
         if not self.settings.user_id:
             raise RuntimeError("ユーザーIDがありません。再ログインしてください。")
-        prints = self._prints_api.get_user_prints(self.settings.user_id)
+        prints = self._call_authenticated_api(
+            lambda: self._prints_api.get_user_prints(self.settings.user_id)
+        )
         if prints is None:
             return []
         result: list[PrintInfo] = []
@@ -239,7 +400,7 @@ class VRChatClient:
 
     def get_print(self, print_id: str) -> PrintInfo:
         self._ensure_client()
-        item = self._prints_api.get_print(print_id)
+        item = self._call_authenticated_api(lambda: self._prints_api.get_print(print_id))
         if isinstance(item, dict):
             return self._to_print_info(item)
         return PrintInfo(
@@ -292,12 +453,7 @@ class VRChatClient:
             timeout=120,
         )
 
-        if response.status_code >= 400:
-            try:
-                detail = response.json().get("error", {}).get("message", response.text)
-            except Exception:
-                detail = response.text
-            raise RuntimeError(f"アップロード失敗 ({response.status_code}): {detail}")
+        self._raise_for_http_response(response, "アップロード失敗")
 
         payload = response.json()
         if isinstance(payload, dict):
@@ -327,12 +483,7 @@ class VRChatClient:
             timeout=120,
         )
 
-        if response.status_code >= 400:
-            try:
-                detail = response.json().get("error", {}).get("message", response.text)
-            except Exception:
-                detail = response.text
-            raise RuntimeError(f"編集失敗 ({response.status_code}): {detail}")
+        self._raise_for_http_response(response, "編集失敗")
 
         payload = response.json()
         if isinstance(payload, dict):
@@ -341,7 +492,7 @@ class VRChatClient:
 
     def delete_print(self, print_id: str) -> None:
         self._ensure_client()
-        self._prints_api.delete_print(print_id)
+        self._call_authenticated_api(lambda: self._prints_api.delete_print(print_id))
 
     def list_gallery_photos(self) -> list[GalleryInfo]:
         self._ensure_client()
@@ -352,12 +503,7 @@ class VRChatClient:
             cookies=self._auth_cookies(),
             timeout=60,
         )
-        if response.status_code >= 400:
-            try:
-                detail = response.json().get("error", {}).get("message", response.text)
-            except Exception:
-                detail = response.text
-            raise RuntimeError(f"ギャラリー一覧取得失敗 ({response.status_code}): {detail}")
+        self._raise_for_http_response(response, "ギャラリー一覧取得失敗")
 
         payload = response.json()
         if not isinstance(payload, list):
@@ -387,12 +533,7 @@ class VRChatClient:
             timeout=120,
         )
 
-        if response.status_code >= 400:
-            try:
-                detail = response.json().get("error", {}).get("message", response.text)
-            except Exception:
-                detail = response.text
-            raise RuntimeError(f"ギャラリーアップロード失敗 ({response.status_code}): {detail}")
+        self._raise_for_http_response(response, "ギャラリーアップロード失敗")
 
         payload = response.json()
         if isinstance(payload, dict):
@@ -411,12 +552,7 @@ class VRChatClient:
             cookies=self._auth_cookies(),
             timeout=60,
         )
-        if response.status_code >= 400:
-            try:
-                detail = response.json().get("error", {}).get("message", response.text)
-            except Exception:
-                detail = response.text
-            raise RuntimeError(f"アイコン一覧取得失敗 ({response.status_code}): {detail}")
+        self._raise_for_http_response(response, "アイコン一覧取得失敗")
 
         payload = response.json()
         if not isinstance(payload, list):
@@ -442,12 +578,7 @@ class VRChatClient:
             timeout=120,
         )
 
-        if response.status_code >= 400:
-            try:
-                detail = response.json().get("error", {}).get("message", response.text)
-            except Exception:
-                detail = response.text
-            raise RuntimeError(f"アイコンアップロード失敗 ({response.status_code}): {detail}")
+        self._raise_for_http_response(response, "アイコンアップロード失敗")
 
         payload = response.json()
         if isinstance(payload, dict):
@@ -459,7 +590,7 @@ class VRChatClient:
 
     def get_active_user_icon_url(self) -> str:
         self._ensure_client()
-        user = self._auth_api.get_current_user()
+        user = self._call_authenticated_api(self._auth_api.get_current_user)
         return str(getattr(user, "user_icon", "") or "")
 
     def set_active_user_icon(self, profile_url: str) -> str:
@@ -478,12 +609,7 @@ class VRChatClient:
             timeout=60,
         )
 
-        if response.status_code >= 400:
-            try:
-                detail = response.json().get("error", {}).get("message", response.text)
-            except Exception:
-                detail = response.text
-            raise RuntimeError(f"アイコン設定失敗 ({response.status_code}): {detail}")
+        self._raise_for_http_response(response, "アイコン設定失敗")
 
         payload = response.json()
         if isinstance(payload, dict):
@@ -498,12 +624,7 @@ class VRChatClient:
             cookies=self._auth_cookies(),
             timeout=60,
         )
-        if response.status_code >= 400:
-            try:
-                detail = response.json().get("error", {}).get("message", response.text)
-            except Exception:
-                detail = response.text
-            raise RuntimeError(f"{label}削除失敗 ({response.status_code}): {detail}")
+        self._raise_for_http_response(response, f"{label}削除失敗")
 
     def _parse_file_record(self, data: dict) -> tuple[str, str, str, int, str]:
         file_id = str(data.get("id", ""))
@@ -561,10 +682,14 @@ class VRChatClient:
         cookies: dict[str, str] = {}
         if self._api_client:
             for cookie in self._api_client.rest_client.cookie_jar:
-                cookies[cookie.name] = cookie.value
-        token = self._extract_auth_value(self.settings.auth_cookie)
-        if token and "auth" not in cookies:
-            cookies["auth"] = token
+                if cookie.name in {"auth", "twoFactorAuth"} and cookie.value:
+                    cookies[cookie.name] = cookie.value
+        auth_token = self._extract_auth_value(self.settings.auth_cookie)
+        if auth_token and "auth" not in cookies:
+            cookies["auth"] = auth_token
+        two_factor_token = self._extract_auth_value(self.settings.two_factor_auth_cookie)
+        if two_factor_token and "twoFactorAuth" not in cookies:
+            cookies["twoFactorAuth"] = two_factor_token
         return cookies
 
     def _is_image_bytes(self, data: bytes) -> bool:
@@ -643,3 +768,7 @@ class TwoFactorRequired(Exception):
     def __init__(self, kind: str):
         super().__init__(kind)
         self.kind = kind
+
+
+class SessionExpiredError(Exception):
+    """Saved auth cookie is missing or no longer valid."""

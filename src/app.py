@@ -20,7 +20,14 @@ from .config import AppSettings, app_data_dir
 from .paths import app_icon_path
 from .gallery_prepare import prepare_gallery_image
 from .icon_prepare import prepare_icon_image
-from .vrchat_client import GalleryInfo, IconInfo, PrintInfo, TwoFactorRequired, VRChatClient
+from .vrchat_client import (
+    GalleryInfo,
+    IconInfo,
+    PrintInfo,
+    SessionExpiredError,
+    TwoFactorRequired,
+    VRChatClient,
+)
 from .print_converter import (
     ORIG_H,
     ORIG_W,
@@ -132,11 +139,8 @@ class VRCMemApp(ctk.CTk):
 
         self._build_layout()
         self._load_settings_into_ui()
+        self._show_page("login")
         self._try_restore_session()
-        if self.client.is_logged_in:
-            self._show_page("gallery", auto_load=True)
-        else:
-            self._show_page("login")
 
     def _set_window_icon(self) -> None:
         icon_path = app_icon_path()
@@ -1025,7 +1029,21 @@ class VRCMemApp(ctk.CTk):
     def _try_restore_session(self) -> None:
         if not self.settings.auth_cookie or not self.settings.contact_email.strip():
             return
-        self._run_async(self._restore_session_worker, on_success=lambda _: self._show_page("gallery", auto_load=True), show_progress=False)
+
+        def on_success(_: str) -> None:
+            self._update_status()
+            self._show_page("gallery", auto_load=True)
+
+        def on_session_expired() -> None:
+            self._update_status()
+
+        self._run_async(
+            self._restore_session_worker,
+            on_success=on_success,
+            on_session_expired=on_session_expired,
+            show_progress=False,
+            notify_session_expired=False,
+        )
 
     def _login(self) -> None:
         username = self.login_entries["username"].get().strip()
@@ -1805,12 +1823,29 @@ class VRCMemApp(ctk.CTk):
     def _set_progress(self, value: float) -> None:
         self.progress.set(max(0.0, min(1.0, value)))
 
+    def _handle_session_expired(self, message: str, *, notify: bool = True) -> None:
+        self.client.clear_local_session()
+        self._update_status()
+        self._show_page("login")
+        if notify:
+            messagebox.showwarning("セッション切れ", message)
+
+    def _mark_list_fetch_failed(self) -> None:
+        if self._active_page == "gallery" and hasattr(self, "gallery_status_label"):
+            self.gallery_status_label.configure(text="取得失敗")
+        elif self._active_page == "print" and hasattr(self, "prints_status_label"):
+            self.prints_status_label.configure(text="取得失敗")
+        elif self._active_page == "icon" and hasattr(self, "icon_status_label"):
+            self.icon_status_label.configure(text="取得失敗")
+
     def _run_async(
         self,
         worker: Callable[[], object],
         on_success: Callable[[object], None] | None = None,
         on_finish: Callable[[], None] | None = None,
+        on_session_expired: Callable[[], None] | None = None,
         show_progress: bool = True,
+        notify_session_expired: bool = True,
     ) -> None:
         if show_progress:
             self.progress.grid()
@@ -1821,17 +1856,30 @@ class VRCMemApp(ctk.CTk):
             try:
                 result = worker()
             except TwoFactorRequired as exc:
-                kind = exc.kind
-                self.after(0, lambda k=kind: messagebox.showwarning("2FAが必要", f"{k} の2FAコードを入力して再試行してください。"))
+                label = "TOTP（認証アプリ）" if exc.kind == "totp" else "メール"
+                self.after(
+                    0,
+                    lambda text=label: messagebox.showinfo(
+                        "2FAが必要",
+                        f"{text} の認証コードを入力して、もう一度「ログイン」を押してください。\n"
+                        "（パスワードの再入力は不要です）",
+                    ),
+                )
+            except SessionExpiredError as exc:
+                message = str(exc)
+
+                def handle_expired() -> None:
+                    if on_session_expired:
+                        on_session_expired()
+                    else:
+                        self._handle_session_expired(message, notify=notify_session_expired)
+                    self._mark_list_fetch_failed()
+
+                self.after(0, handle_expired)
             except Exception as exc:
                 message = str(exc)
                 self.after(0, lambda msg=message: messagebox.showerror("エラー", msg))
-                if self._active_page == "gallery" and hasattr(self, "gallery_status_label"):
-                    self.after(0, lambda: self.gallery_status_label.configure(text="取得失敗"))
-                elif self._active_page == "print" and hasattr(self, "prints_status_label"):
-                    self.after(0, lambda: self.prints_status_label.configure(text="取得失敗"))
-                elif self._active_page == "icon" and hasattr(self, "icon_status_label"):
-                    self.after(0, lambda: self.icon_status_label.configure(text="取得失敗"))
+                self.after(0, self._mark_list_fetch_failed)
             else:
                 if on_success:
                     success_result = result

@@ -50,5 +50,12 @@ python main.py
 
 ## 注意
 
-- Print のアップロードには **VRChat Plus (VRC+)** が必要です
+- Print・ユーザーアイコンのアップロードには **VRChat Plus (VRC+)** が必要です
 - 連絡先メールは VRChat API の User-Agent 要件のため必須です
+- このアプリは VRChat **非公式**の API を使用します。利用は自己責任です。API は予告なく変更・停止される場合があります
+- VRChat の規約・ガイドラインに従ってください
+  - [Terms of Service](https://hello.vrchat.com/legal)
+  - [Community Guidelines](https://hello.vrchat.com/community-guidelines)
+  - [Creator Guidelines](https://hello.vrchat.com/creator-guidelines)（API 利用の注意は「API Usage / Bots」）
+- ログイン時の `auth` cookie は **ローカル PC**（`%APPDATA%\VRCMemPlus\settings.json`）にのみ保存されます。開発者のサーバーには送信しません。パスワードは保存しません
+- アップロードする画像の内容（SFW など）は利用者の責任です。大量の連続アップロードは避けてください
